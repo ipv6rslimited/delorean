@@ -5,7 +5,7 @@
 ## Features
 
 - Multi-port
-- Signal handling for graceful shutdown and configuration reload
+- Signal handling for graceful shutdown
 - LRU cache for DNS lookups with a configurable TTL (Time-To-Live)
 - Supports both TLS and HTTP connections to extract the hostname
 - Backend connection based on IPv6 addresses with a specific prefix
@@ -24,21 +24,21 @@ These tests were performed in a Virtual Machine running on a 4 year old laptop.
 
 ```
 $ go test -v main.go main_test.go
-=== RUN   TestGetNameFromTLSConnection
-2024/05/19 18:43:39 Packet Data: 16030300720100006e0303b6b26afb555e03d565a36af05ea5430293b959a754c3dd78575834c582fd53d1000004000100ff010000410000000e000c00000f7777772e6578616d706c652e636f6d000d0020001e060106020603050105020503040104020403030103020303020102020203000f000101
---- PASS: TestGetNameFromTLSConnection (0.00s)
-=== RUN   TestGetNameFromHTTPConnection
---- PASS: TestGetNameFromHTTPConnection (0.00s)
+=== RUN   TestGetNameAndBufferFromTLSConnection
+2024/05/20 19:38:34 Packet Data: 16030300720100006e0303b6b26afb555e03d565a36af05ea5430293b959a754c3dd78575834c582fd53d1000004000100ff010000410000000e000c00000f7777772e6578616d706c652e636f6d000d0020001e060106020603050105020503040104020403030103020303020102020203000f000101
+--- PASS: TestGetNameAndBufferFromTLSConnection (0.00s)
+=== RUN   TestGetNameAndBufferFromHTTPConnection
+--- PASS: TestGetNameAndBufferFromHTTPConnection (0.00s)
 === RUN   TestStressServer
-    main_test.go:196: Total failed connections: 0 out of 1000 attempts
---- PASS: TestStressServer (11.02s)
+    main_test.go:207: Total failed connections: 0 out of 1000 attempts
+--- PASS: TestStressServer (1.04s)
 === RUN   TestMemoryUsage
-2024/05/19 18:43:50 Packet Data: 16030300720100006e0303b6b26afb555e03d565a36af05ea5430293b959a754c3dd78575834c582fd53d1000004000100ff010000410000000e000c00000f7777772e6578616d706c652e636f6d000d0020001e060106020603050105020503040104020403030103020303020102020203000f000101
-2024/05/19 18:43:50 Memory before: Alloc = 10226432 TotalAlloc = 888812720 Sys = 48059656 NumGC = 126
-2024/05/19 18:43:50 Memory after: Alloc = 14402464 TotalAlloc = 892988752 Sys = 48059656 NumGC = 126
---- PASS: TestMemoryUsage (0.00s)
+2024/05/20 19:38:35 Packet Data: 16030300720100006e0303b6b26afb555e03d565a36af05ea5430293b959a754c3dd78575834c582fd53d1000004000100ff010000410000000e000c00000f7777772e6578616d706c652e636f6d000d0020001e060106020603050105020503040104020403030103020303020102020203000f000101
+2024/05/20 19:38:35 Memory before: Alloc = 890480 TotalAlloc = 890480 Sys = 12801288 NumGC = 0
+2024/05/20 19:38:35 Memory after: Alloc = 2600808 TotalAlloc = 21688720 Sys = 13194504 NumGC = 7
+--- PASS: TestMemoryUsage (0.01s)
 PASS
-ok  	command-line-arguments	11.021s
+ok  	command-line-arguments	1.050s
 ```
 
 ```

@@ -17,6 +17,7 @@ import (
   "encoding/binary"
   "encoding/json"
   "fmt"
+  "io"
   "log"
   "net"
   "os"
@@ -26,7 +27,6 @@ import (
   "syscall"
   "time"
   "github.com/ipv6rslimited/lrucache"
-  "github.com/ipv6rslimited/peeker"
   "github.com/ipv6rslimited/peter"
 )
 
@@ -43,16 +43,18 @@ type CacheEntry struct {
 }
 
 var (
-  config      Config
-  dnsCache =  lrucache.NewLRUCache(4096)
-  servers     []net.Listener
-  wg          sync.WaitGroup
-  shutdown =  make(chan struct{})
-  serverMutex sync.Mutex
-  logger      *log.Logger
+  config                Config
+  dnsCache            = lrucache.NewLRUCache(4096)
+  servers               []net.Listener
+  wg                    sync.WaitGroup
+  logger               *log.Logger
+  shutdown              chan struct{}
+  maxBufferedDataSize = 16384
+  maxConnectTime      = 30
 )
 
 type nullWriter struct{}
+
 
 func main() {
   enableLogging := false
@@ -62,12 +64,84 @@ func main() {
   loadConfig()
   handleSignals()
 
-  for _, port := range config.Ports {
-    logger.Printf("Starting server on port %d", port)
-    go startServer(port)
-  }
+  startAllServers()
 
-  select {}
+  wg.Wait()
+}
+
+func startAllServers() {
+  logger.Println("Starting all servers")
+  shutdown = make(chan struct{})
+  for _, port := range config.Ports {
+    wg.Add(1)
+    go func(port int) {
+      defer wg.Done()
+      startServer(port)
+    }(port)
+  }
+}
+
+func handleSignals() {
+  logger.Println("Setting up signal handling")
+  signalChan := make(chan os.Signal, 1)
+  signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+
+  go func() {
+    for sig := range signalChan {
+      switch sig {
+      case syscall.SIGINT, syscall.SIGTERM:
+        logger.Println("Received SIGINT or SIGTERM signal, shutting down servers")
+        stopServers()
+        os.Exit(0)
+      }
+    }
+  }()
+}
+
+func stopServers() {
+  logger.Println("Stopping servers")
+  close(shutdown)
+
+  for _, server := range servers {
+    logger.Printf("Closing server on %s", server.Addr())
+    server.Close()
+  }
+  servers = nil
+
+  time.Sleep(2 * time.Second)
+
+  wg.Wait()
+
+  logger.Println("All servers stopped")
+}
+
+func startServer(port int) {
+  listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", config.IP, port))
+  if err != nil {
+    logger.Printf("Failed to start server on port %d: %v", port, err)
+    return
+  }
+  logger.Printf("Server started on %s:%d", config.IP, port)
+
+  servers = append(servers, listener)
+
+  wg.Add(1)
+  defer wg.Done()
+
+  for {
+    client, err := listener.Accept()
+    if err != nil {
+      select {
+      case <-shutdown:
+        logger.Printf("Shutting down server on port %d", port)
+        return
+      default:
+        continue
+      }
+    }
+    logger.Printf("Accepted connection from %s", client.RemoteAddr())
+    go handleConnection(client)
+  }
 }
 
 func (nw nullWriter) Write(p []byte) (n int, err error) {
@@ -102,78 +176,11 @@ func loadConfig() {
   logger.Printf("Config loaded: %+v", config)
 }
 
-func handleSignals() {
-  logger.Println("Setting up signal handling")
-  signalChan := make(chan os.Signal, 1)
-  signal.Notify(signalChan, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
-
-  go func() {
-    for sig := range signalChan {
-      switch sig {
-      case syscall.SIGHUP:
-        logger.Println("Received SIGHUP signal, reloading configuration")
-        loadConfig()
-        stopServers()
-        for _, port := range config.Ports {
-          go startServer(port)
-        }
-      case syscall.SIGINT, syscall.SIGTERM:
-        logger.Println("Received SIGINT or SIGTERM signal, shutting down servers")
-        stopServers()
-        os.Exit(0)
-      }
-    }
-  }()
-}
-
-func stopServers() {
-  logger.Println("Stopping servers")
-  serverMutex.Lock()
-  defer serverMutex.Unlock()
-
-  close(shutdown)
-  for _, server := range servers {
-    server.Close()
-  }
-  wg.Wait()
-  servers = nil
-  logger.Println("All servers stopped")
-}
-
-func startServer(port int) {
-  listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", config.IP, port))
-  if err != nil {
-    logger.Printf("Failed to start server on port %d: %v", port, err)
-    return
-  }
-  logger.Printf("Server started on %s:%d", config.IP, port)
-
-  serverMutex.Lock()
-  servers = append(servers, listener)
-  serverMutex.Unlock()
-
-  wg.Add(1)
-  defer wg.Done()
-
-  for {
-    client, err := listener.Accept()
-    if err != nil {
-      select {
-      case <-shutdown:
-        logger.Printf("Shutting down server on port %d", port)
-        return
-      default:
-        continue
-      }
-    }
-    logger.Printf("Accepted connection from %s", client.RemoteAddr())
-    go handleConnection(client)
-  }
-}
-
 func handleConnection(client net.Conn) {
   defer client.Close()
+
   logger.Printf("Handling connection from %s", client.RemoteAddr())
+  client.SetDeadline(time.Now().Add(time.Duration(maxConnectTime) * time.Second))
 
   reader := bufio.NewReader(client)
   initialBytes, err := reader.Peek(5)
@@ -183,13 +190,14 @@ func handleConnection(client net.Conn) {
   }
 
   var name string
+  var bufferedData []byte
 
   if isTLS(initialBytes) {
     logger.Println("Connection is TLS")
-    name, err = getNameFromTLSConnection(reader)
+    name, bufferedData, err = getNameAndBufferFromTLSConnection(reader)
   } else {
     logger.Println("Connection is HTTP")
-    name, err = getNameFromHTTPConnection(reader)
+    name, bufferedData, err = getNameAndBufferFromHTTPConnection(reader)
   }
 
   if err != nil || name == "" {
@@ -207,151 +215,229 @@ func handleConnection(client net.Conn) {
 
   logger.Printf("Resolved address: %s", address)
 
-  backend, err := net.Dial("tcp", net.JoinHostPort(address, fmt.Sprint(client.LocalAddr().(*net.TCPAddr).Port)))
+  backend, err := net.DialTimeout("tcp", net.JoinHostPort(address, fmt.Sprint(client.LocalAddr().(*net.TCPAddr).Port)), time.Duration(maxConnectTime)*time.Second)
   if err != nil {
     logger.Printf("Failed to connect to backend: %v", err)
     return
   }
+  defer backend.Close()
 
-  bufferedData := make([]byte, reader.Buffered())
-  _, err = reader.Read(bufferedData)
-  if err != nil {
-    logger.Printf("Failed to read buffered data: %v", err)
-    backend.Close()
-    return
-  }
+  client.SetDeadline(time.Time{})
+  backend.SetDeadline(time.Time{})
 
+  logger.Printf("Writing buffer: %x", bufferedData)
   _, err = backend.Write(bufferedData)
   if err != nil {
     logger.Printf("Failed to write buffered data to backend: %v", err)
-    backend.Close()
     return
   }
 
   logger.Println("Starting data piping between client and backend")
   piper := peter.NewPeter(client, backend)
   piper.Start()
+  defer logger.Println("Ending data piping between client and backend")
 }
 
-func getNameFromTLSConnection(reader *bufio.Reader) (string, error) {
-  logger.Println("Extracting name from TLS connection")
-  p := peeker.NewPeeker(reader)
+func getNameAndBufferFromHTTPConnection(reader *bufio.Reader) (string, []byte, error) {
+  logger.Println("Extracting name from HTTP connection")
+  bufferedData := make([]byte, 0, maxBufferedDataSize)
+  var host string
 
-  _, err := p.GetBytes(43)
-  if err != nil {
-    return "", fmt.Errorf("failed to read initial bytes: %w", err)
-  }
-
-  sessionIDLength, err := p.GetByte()
-  if err != nil {
-    return "", fmt.Errorf("failed to read session ID length: %w", err)
-  }
-
-  _, err = p.GetBytes(int(sessionIDLength))
-  if err != nil {
-    return "", fmt.Errorf("failed to read session ID: %w", err)
-  }
-
-  cipherSuitesLengthBytes, err := p.GetBytes(2)
-  if err != nil {
-    return "", fmt.Errorf("failed to read cipher suites length: %w", err)
-  }
-  cipherSuitesLength := binary.BigEndian.Uint16(cipherSuitesLengthBytes)
-
-  _, err = p.GetBytes(int(cipherSuitesLength))
-  if err != nil {
-    return "", fmt.Errorf("failed to read cipher suites: %w", err)
-  }
-
-  compressionMethodsLength, err := p.GetByte()
-  if err != nil {
-    return "", fmt.Errorf("failed to read compression methods length: %w", err)
-  }
-
-  _, err = p.GetBytes(int(compressionMethodsLength))
-  if err != nil {
-    return "", fmt.Errorf("failed to read compression methods: %w", err)
-  }
-
-  extensionsLengthBytes, err := p.GetBytes(2)
-  if err != nil {
-    return "", fmt.Errorf("failed to read extensions length: %w", err)
-  }
-
-  extensionsLength := binary.BigEndian.Uint16(extensionsLengthBytes)
-  extensionsEndIndex := p.Offset + int(extensionsLength)
-
-  for p.Offset < extensionsEndIndex {
-    extensionTypeBytes, err := p.GetBytes(2)
+  for {
+    line, err := reader.ReadString('\n')
     if err != nil {
-      return "", fmt.Errorf("failed to read extension type: %w", err)
-    }
-
-    extensionType := binary.BigEndian.Uint16(extensionTypeBytes)
-
-    extensionLengthBytes, err := p.GetBytes(2)
-    if err != nil {
-      return "", fmt.Errorf("failed to read extension length: %w", err)
-    }
-    extensionLength := binary.BigEndian.Uint16(extensionLengthBytes)
-
-    if extensionType == 0x0000 {
-      if _, err := p.GetBytes(2); err != nil {
-        return "", fmt.Errorf("failed to skip server name list length: %w", err)
-      }
-
-      serverNameType, err := p.GetByte()
-      if err != nil {
-        return "", fmt.Errorf("failed to read server name type: %w", err)
-      }
-      if serverNameType != 0 {
+      if err == io.EOF {
         break
       }
-
-      serverNameLengthBytes, err := p.GetBytes(2)
-      if err != nil {
-        return "", fmt.Errorf("failed to read server name length: %w", err)
-      }
-      serverNameLength := binary.BigEndian.Uint16(serverNameLengthBytes)
-
-      serverNameBytes, err := p.GetBytes(int(serverNameLength))
-      if err != nil {
-        return "", fmt.Errorf("failed to read server name: %w", err)
-      }
-
-      serverName := string(serverNameBytes)
-      logger.Printf("Extracted server name from TLS: %s", serverName)
-      return serverName, nil
-    } else {
-      _, err = p.GetBytes(int(extensionLength))
-      if err != nil {
-        return "", fmt.Errorf("failed to skip extension: %w", err)
-      }
+      return "", nil, fmt.Errorf("failed to read line: %w", err)
     }
-  }
-  return "", fmt.Errorf("SNI extension not found")
-}
 
-func getNameFromHTTPConnection(reader *bufio.Reader) (string, error) {
-  logger.Println("Extracting name from HTTP connection")
-  p := peeker.NewPeeker(reader)
-  for {
-    line, err := p.GetLine()
-    if err != nil {
-      return "", err
+    bufferedData = append(bufferedData, []byte(line)...)
+    if len(bufferedData) > maxBufferedDataSize {
+      return "", nil, fmt.Errorf("buffered data exceeds maximum size")
     }
+
+    line = strings.TrimRight(line, "\r\n")
 
     if strings.HasPrefix(line, "Host: ") {
-      host := strings.TrimSpace(line[6:])
+      host = strings.TrimSpace(line[6:])
       logger.Printf("Extracted host from HTTP: %s", host)
-      return host, nil
     }
 
     if len(line) == 0 {
       break
     }
   }
-  return "", fmt.Errorf("host header not found")
+
+  if host == "" {
+    return "", nil, fmt.Errorf("host header not found")
+  }
+
+  remainingData := make([]byte, reader.Buffered())
+  n, err := reader.Read(remainingData)
+  if err != nil && err != io.EOF {
+    return "", nil, fmt.Errorf("failed to read remaining data: %w", err)
+  }
+
+  if len(bufferedData)+n > maxBufferedDataSize {
+    return "", nil, fmt.Errorf("remaining data exceeds maximum buffer size")
+  }
+  bufferedData = append(bufferedData, remainingData[:n]...)
+
+  return host, bufferedData, nil
+}
+
+func getNameAndBufferFromTLSConnection(reader *bufio.Reader) (string, []byte, error) {
+  logger.Println("Extracting name from TLS connection")
+
+  bufferedData := make([]byte, 0, maxBufferedDataSize)
+
+  initialBytes := make([]byte, 43)
+  _, err := io.ReadFull(reader, initialBytes)
+  if err != nil {
+    return "", nil, fmt.Errorf("failed to read initial bytes: %w", err)
+  }
+  bufferedData = append(bufferedData, initialBytes...)
+
+  sessionIDLength, err := reader.ReadByte()
+  if err != nil {
+    return "", nil, fmt.Errorf("failed to read session ID length: %w", err)
+  }
+  bufferedData = append(bufferedData, sessionIDLength)
+
+  sessionID := make([]byte, sessionIDLength)
+  if len(bufferedData)+len(sessionID) > maxBufferedDataSize {
+    return "", nil, fmt.Errorf("buffered data exceeds maximum size")
+  }
+  _, err = io.ReadFull(reader, sessionID)
+  if err != nil {
+    return "", nil, fmt.Errorf("failed to read session ID: %w", err)
+  }
+  bufferedData = append(bufferedData, sessionID...)
+
+  cipherSuitesLengthBytes := make([]byte, 2)
+  _, err = io.ReadFull(reader, cipherSuitesLengthBytes)
+  if err != nil {
+    return "", nil, fmt.Errorf("failed to read cipher suites length: %w", err)
+  }
+  bufferedData = append(bufferedData, cipherSuitesLengthBytes...)
+  cipherSuitesLength := binary.BigEndian.Uint16(cipherSuitesLengthBytes)
+
+  cipherSuites := make([]byte, cipherSuitesLength)
+  if len(bufferedData)+len(cipherSuites) > maxBufferedDataSize {
+    return "", nil, fmt.Errorf("buffered data exceeds maximum size")
+  }
+  _, err = io.ReadFull(reader, cipherSuites)
+  if err != nil {
+    return "", nil, fmt.Errorf("failed to read cipher suites: %w", err)
+  }
+  bufferedData = append(bufferedData, cipherSuites...)
+
+  compressionMethodsLength, err := reader.ReadByte()
+  if err != nil {
+    return "", nil, fmt.Errorf("failed to read compression methods length: %w", err)
+  }
+  bufferedData = append(bufferedData, compressionMethodsLength)
+
+  compressionMethods := make([]byte, compressionMethodsLength)
+  if len(bufferedData)+len(compressionMethods) > maxBufferedDataSize {
+    return "", nil, fmt.Errorf("buffered data exceeds maximum size")
+  }
+  _, err = io.ReadFull(reader, compressionMethods)
+  if err != nil {
+    return "", nil, fmt.Errorf("failed to read compression methods: %w", err)
+  }
+  bufferedData = append(bufferedData, compressionMethods...)
+
+  extensionsLengthBytes := make([]byte, 2)
+  _, err = io.ReadFull(reader, extensionsLengthBytes)
+  if err != nil {
+    return "", nil, fmt.Errorf("failed to read extensions length: %w", err)
+  }
+  bufferedData = append(bufferedData, extensionsLengthBytes...)
+  extensionsLength := binary.BigEndian.Uint16(extensionsLengthBytes)
+  extensionsEndIndex := int(extensionsLength)
+
+  for extensionsEndIndex > 0 {
+    extensionTypeBytes := make([]byte, 2)
+    _, err = io.ReadFull(reader, extensionTypeBytes)
+    if err != nil {
+      return "", nil, fmt.Errorf("failed to read extension type: %w", err)
+    }
+    bufferedData = append(bufferedData, extensionTypeBytes...)
+    extensionType := binary.BigEndian.Uint16(extensionTypeBytes)
+
+    extensionLengthBytes := make([]byte, 2)
+    _, err = io.ReadFull(reader, extensionLengthBytes)
+    if err != nil {
+      return "", nil, fmt.Errorf("failed to read extension length: %w", err)
+    }
+    bufferedData = append(bufferedData, extensionLengthBytes...)
+    extensionLength := binary.BigEndian.Uint16(extensionLengthBytes)
+    extensionsEndIndex -= 4 + int(extensionLength)
+
+    if extensionType == 0x0000 {
+      serverNameListLengthBytes := make([]byte, 2)
+      _, err = io.ReadFull(reader, serverNameListLengthBytes)
+      if err != nil {
+        return "", nil, fmt.Errorf("failed to read server name list length: %w", err)
+      }
+      bufferedData = append(bufferedData, serverNameListLengthBytes...)
+
+      serverNameType, err := reader.ReadByte()
+      if err != nil {
+        return "", nil, fmt.Errorf("failed to read server name type: %w", err)
+      }
+      bufferedData = append(bufferedData, serverNameType)
+      if serverNameType != 0 {
+        break
+      }
+
+      serverNameLengthBytes := make([]byte, 2)
+      _, err = io.ReadFull(reader, serverNameLengthBytes)
+      if err != nil {
+        return "", nil, fmt.Errorf("failed to read server name length: %w", err)
+      }
+      bufferedData = append(bufferedData, serverNameLengthBytes...)
+      serverNameLength := binary.BigEndian.Uint16(serverNameLengthBytes)
+
+      serverNameBytes := make([]byte, serverNameLength)
+      if len(bufferedData)+len(serverNameBytes) > maxBufferedDataSize {
+        return "", nil, fmt.Errorf("buffered data exceeds maximum size")
+      }
+      _, err = io.ReadFull(reader, serverNameBytes)
+      if err != nil {
+        return "", nil, fmt.Errorf("failed to read server name: %w", err)
+      }
+      bufferedData = append(bufferedData, serverNameBytes...)
+
+      serverName := string(serverNameBytes)
+      logger.Printf("Extracted server name from TLS: %s", serverName)
+
+      remainingData := make([]byte, reader.Buffered())
+      n, err := reader.Read(remainingData)
+      if err != nil && err != io.EOF {
+        return "", nil, fmt.Errorf("failed to read remaining data: %w", err)
+      }
+      if len(bufferedData)+n > maxBufferedDataSize {
+        return "", nil, fmt.Errorf("remaining data exceeds maximum buffer size")
+      }
+      bufferedData = append(bufferedData, remainingData[:n]...)
+
+      return serverName, bufferedData, nil
+    } else {
+      extensionData := make([]byte, extensionLength)
+      if len(bufferedData)+len(extensionData) > maxBufferedDataSize {
+        return "", nil, fmt.Errorf("buffered data exceeds maximum size")
+      }
+      _, err = io.ReadFull(reader, extensionData)
+      if err != nil {
+        return "", nil, fmt.Errorf("failed to skip extension: %w", err)
+      }
+      bufferedData = append(bufferedData, extensionData...)
+    }
+  }
+  return "", nil, fmt.Errorf("SNI extension not found")
 }
 
 func lookupWithCache(hostname string) (string, error) {

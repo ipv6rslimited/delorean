@@ -1,6 +1,4 @@
 github.com/ipv6rslimited/lrucache v1.0.0 h1:Ns9vpipQLPd3E9MHIjkNa4RFoo4/v/Jtr2s5SkWJVnE=
 github.com/ipv6rslimited/lrucache v1.0.0/go.mod h1:Xt4GFTJyEZ19s9uPKevgwTtuAW2vMfLyulX/AEDyKe4=
-github.com/ipv6rslimited/peeker v1.0.3 h1:KkC9oSWElEz/lOwKkztUaKRzpJ4gDRc/Gi4bqdIi7rg=
-github.com/ipv6rslimited/peeker v1.0.3/go.mod h1:oY2cva4BiI1pHC7TcK0vWMRvzufbFZrxgwb4yExwQFY=
-github.com/ipv6rslimited/peter v1.0.1 h1:G5Q9To9nKZwl2CdniNVnPIBj4Uo79oCESIdpMZSOHgQ=
-github.com/ipv6rslimited/peter v1.0.1/go.mod h1:Oap/pZXH8U9gJJY117QYXSuKjH5i8ENDWXL2W6VbzGo=
+github.com/ipv6rslimited/peter v1.0.4 h1:36MoZUIUFC0MMIeQwq8nK7BbK53tOf8+t0ALnm8hpUE=
+github.com/ipv6rslimited/peter v1.0.4/go.mod h1:Oap/pZXH8U9gJJY117QYXSuKjH5i8ENDWXL2W6VbzGo=

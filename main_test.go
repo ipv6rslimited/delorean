@@ -105,12 +105,12 @@ func createFakeClientHelloPacket(serverName string) []byte {
   return packet.Bytes()
 }
 
-func TestGetNameFromTLSConnection(t *testing.T) {
+func TestGetNameAndBufferFromTLSConnection(t *testing.T) {
   serverName := "www.example.com"
   tlsData := createFakeClientHelloPacket(serverName)
 
   reader := bufio.NewReaderSize(bytes.NewReader(tlsData), 4096)
-  name, err := getNameFromTLSConnection(reader)
+  name, _, err := getNameAndBufferFromTLSConnection(reader)
   if err != nil {
     t.Fatalf("Expected no error, got %v", err)
   }
@@ -120,11 +120,11 @@ func TestGetNameFromTLSConnection(t *testing.T) {
   }
 }
 
-func TestGetNameFromHTTPConnection(t *testing.T) {
+func TestGetNameAndBufferFromHTTPConnection(t *testing.T) {
   httpData := []byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
   reader := bufio.NewReader(bytes.NewReader(httpData))
 
-  name, err := getNameFromHTTPConnection(reader)
+  name, _, err := getNameAndBufferFromHTTPConnection(reader)
   if err != nil {
     t.Fatalf("Expected no error, got %v", err)
   }
@@ -135,25 +135,25 @@ func TestGetNameFromHTTPConnection(t *testing.T) {
   }
 }
 
-func BenchmarkGetNameFromTLSConnection(b *testing.B) {
+func BenchmarkGetNameAndBufferFromTLSConnection(b *testing.B) {
   serverName := "www.example.com"
   tlsData := createFakeClientHelloPacket(serverName)
 
   for i := 0; i < b.N; i++ {
     reader := bufio.NewReaderSize(bytes.NewReader(tlsData), 4096)
-    _, err := getNameFromTLSConnection(reader)
+    _, _, err := getNameAndBufferFromTLSConnection(reader)
     if err != nil {
       b.Fatalf("Expected no error, got %v", err)
     }
   }
 }
 
-func BenchmarkGetNameFromHTTPConnection(b *testing.B) {
+func BenchmarkGetNameAndBufferFromHTTPConnection(b *testing.B) {
   httpData := []byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
 
   for i := 0; i < b.N; i++ {
     reader := bufio.NewReader(bytes.NewReader(httpData))
-    _, err := getNameFromHTTPConnection(reader)
+    _, _, err := getNameAndBufferFromHTTPConnection(reader)
     if err != nil {
       b.Fatalf("Expected no error, got %v", err)
     }
@@ -200,7 +200,6 @@ func StressTestServer(t *testing.T, serverFunc func(stop chan struct{})) {
     }(i)
   }
 
-  time.Sleep(10 * time.Second)
   close(stop)
   <-serverReady
   wg.Wait()
@@ -225,8 +224,6 @@ func TestStressServer(t *testing.T) {
         wg.Wait()
         return
       default:
-        tcpListener := listener.(*net.TCPListener)
-        tcpListener.SetDeadline(time.Now().Add(1 * time.Second))
         conn, err := listener.Accept()
         if err != nil {
           if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -239,6 +236,7 @@ func TestStressServer(t *testing.T) {
         wg.Add(1)
         go func() {
           defer wg.Done()
+          defer conn.Close()
           handleConnection(conn)
         }()
       }
@@ -257,7 +255,7 @@ func TestMemoryUsage(t *testing.T) {
 
   for i := 0; i < 1000; i++ {
     reader := bufio.NewReaderSize(bytes.NewReader(tlsData), 4096)
-    _, err := getNameFromTLSConnection(reader)
+    _, _, err := getNameAndBufferFromTLSConnection(reader)
     if err != nil {
       t.Fatalf("Expected no error, got %v", err)
     }
