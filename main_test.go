@@ -3,7 +3,7 @@
 ** delorean tests
 ** Tests for delorean
 **
-** Distributed under the COOLER License.
+** Distributed under the COOL License.
 **
 ** Copyright (c) 2024 IPv6.rs <https://ipv6.rs>
 ** All Rights Reserved
